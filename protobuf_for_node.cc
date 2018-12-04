@@ -12,18 +12,18 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
+#include <iostream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <iostream>
-#include <sstream>
 
-#include <node.h>
 #include <nan.h>
+#include <node.h>
 
-#include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/service.h>
 
 #include "protobuf_for_node.h"
@@ -41,19 +41,19 @@ using google::protobuf::ServiceDescriptor;
 
 using Nan::ObjectWrap;
 
+using std::cerr;
+using std::endl;
 using std::map;
 using std::string;
 using std::vector;
-using std::cerr;
-using std::endl;
 
 using v8::Array;
 using v8::Context;
 using v8::External;
 using v8::Function;
 using v8::FunctionTemplate;
-using v8::Integer;
 using v8::Handle;
+using v8::Integer;
 using v8::Local;
 using v8::Number;
 using v8::Object;
@@ -61,432 +61,412 @@ using v8::ObjectTemplate;
 using v8::Persistent;
 using v8::Script;
 using v8::String;
-using v8::Value;
 using v8::V8;
+using v8::Value;
 
 namespace protobuf_for_node {
-  const char E_NO_ARRAY[] = "Not an array";
-  const char E_NO_OBJECT[] = "Not an object";
-  const char E_UNKNOWN_ENUM[] = "Unknown enum value";
+const char E_NO_ARRAY[] = "Not an array";
+const char E_NO_OBJECT[] = "Not an object";
+const char E_UNKNOWN_ENUM[] = "Unknown enum value";
 
-  Nan::Persistent<FunctionTemplate> SchemaTemplate;
-  Nan::Persistent<FunctionTemplate> ServiceSchemaTemplate;
-  Nan::Persistent<FunctionTemplate> ServiceTemplate;
-  Nan::Persistent<FunctionTemplate> MethodTemplate;
-  Nan::Persistent<FunctionTemplate> TypeTemplate;
-  Nan::Persistent<FunctionTemplate> ParseTemplate;
-  Nan::Persistent<FunctionTemplate> SerializeTemplate;
+Nan::Persistent<FunctionTemplate> SchemaTemplate;
+Nan::Persistent<FunctionTemplate> ServiceSchemaTemplate;
+Nan::Persistent<FunctionTemplate> ServiceTemplate;
+Nan::Persistent<FunctionTemplate> MethodTemplate;
+Nan::Persistent<FunctionTemplate> TypeTemplate;
+Nan::Persistent<FunctionTemplate> ParseTemplate;
+Nan::Persistent<FunctionTemplate> SerializeTemplate;
 
-  class Schema : public Nan::ObjectWrap {
+class Schema : public Nan::ObjectWrap {
+public:
+  Schema(Local<Object> self, const DescriptorPool* pool)
+      : pool_(pool) {
+    factory_.SetDelegateToGeneratedFactory(true);
+    self->SetInternalField(1, Nan::New<Array>());
+    Wrap(self);
+  }
+
+  virtual ~Schema() {
+    if (pool_ != DescriptorPool::generated_pool())
+      delete pool_;
+  }
+
+  class Type : public Nan::ObjectWrap {
   public:
-    Schema(Local<Object> self, const DescriptorPool* pool)
-        : pool_(pool) {
-      factory_.SetDelegateToGeneratedFactory(true);
-      self->SetInternalField(1, Nan::New<Array>());
+    Schema* schema_;
+    const Descriptor* descriptor_;
+
+    Message* NewMessage() const { return schema_->NewMessage(descriptor_); }
+
+    Local<Function> Constructor() const {
+      Local<Object> handle = const_cast<Type*>(this)->handle();
+      return handle->GetInternalField(2).As<Function>();
+    }
+
+    Local<Object> NewObject(Local<Value> properties) const { return Nan::NewInstance(Constructor(), 1, &properties).ToLocalChecked(); }
+
+    Type(Schema* schema, const Descriptor* descriptor, Local<Object> self)
+        : schema_(schema)
+        , descriptor_(descriptor) {
+      // Generate functions for bulk conversion between a JS object
+      // and an array in descriptor order:
+      //   from = function(arr) { this.f0 = arr[0]; this.f1 = arr[1]; ... }
+      //   to   = function()    { return [ this.f0, this.f1, ... ] }
+      // This is faster than repeatedly calling Get/Set on a v8::Object.
+      std::ostringstream from, to;
+      from << "(function(arr) { if(arr) {";
+      to << "(function() { return [ ";
+
+      for (int i = 0; i < descriptor->field_count(); i++) {
+        from << "var x = arr[" << i
+             << "]; "
+                "if(x !== undefined) this['"
+             << descriptor->field(i)->camelcase_name() << "'] = x; ";
+
+        if (i > 0)
+          to << ", ";
+        to << "this['" << descriptor->field(i)->camelcase_name() << "']";
+      }
+
+      from << " }})";
+      to << " ]; })";
+
+      // managed type->schema link
+      self->SetInternalField(1, schema_->handle());
+
+      Local<Function> constructor = Script::Compile(Nan::New<String>(from.str()).ToLocalChecked())->Run().As<Function>();
+      Nan::SetPrivate(constructor, Nan::New<String>("type").ToLocalChecked(), self);
+
+      Local<Function> bind = Script::Compile(Nan::New<String>("(function(self) {"
+                                                              "  var f = this;"
+                                                              "  return function(arg) {"
+                                                              "    return f.call(self, arg);"
+                                                              "  };"
+                                                              "})")
+                                                 .ToLocalChecked())
+                                 ->Run()
+                                 .As<Function>();
+      Local<Value> arg = self;
+
+      Local<FunctionTemplate> parseTemplate = Nan::New(ParseTemplate);
+      Local<FunctionTemplate> serializeTemplate = Nan::New(SerializeTemplate);
+
+      constructor->Set(Nan::New<String>("parse").ToLocalChecked(), bind->Call(parseTemplate->GetFunction(), 1, &arg));
+      constructor->Set(Nan::New<String>("serialize").ToLocalChecked(), bind->Call(serializeTemplate->GetFunction(), 1, &arg));
+      self->SetInternalField(2, constructor);
+      self->SetInternalField(3, Script::Compile(Nan::New<String>(to.str()).ToLocalChecked())->Run());
+
       Wrap(self);
     }
 
-    virtual ~Schema() {
-      if (pool_ != DescriptorPool::generated_pool())
-        delete pool_;
+#define GET(TYPE) (index >= 0 ? reflection->GetRepeated##TYPE(instance, field, index) : reflection->Get##TYPE(instance, field))
+
+    static Local<Value> ToJs(
+        const Message& instance, const Reflection* reflection, const FieldDescriptor* field, const Type* message_type, int index) {
+      switch (field->cpp_type()) {
+      case FieldDescriptor::CPPTYPE_MESSAGE:
+        return message_type->ToJs(GET(Message));
+      case FieldDescriptor::CPPTYPE_STRING: {
+        const string& value = GET(String);
+        if (field->type() == FieldDescriptor::TYPE_BYTES) {
+          return Nan::CopyBuffer(const_cast<char*>(value.data()), value.length()).ToLocalChecked();
+        } else {
+          return Nan::New<String>(value.data(), value.length()).ToLocalChecked();
+        }
+      }
+      case FieldDescriptor::CPPTYPE_INT32:
+        return Nan::New<v8::Int32>(GET(Int32));
+      case FieldDescriptor::CPPTYPE_UINT32:
+        return Nan::New<v8::Uint32>(GET(UInt32));
+      case FieldDescriptor::CPPTYPE_INT64: {
+        std::ostringstream ss;
+        ss << GET(Int64);
+        string s = ss.str();
+        return Nan::New<String>(s.data(), s.length()).ToLocalChecked();
+      }
+      case FieldDescriptor::CPPTYPE_UINT64: {
+        std::ostringstream ss;
+        ss << GET(UInt64);
+        string s = ss.str();
+        return Nan::New<String>(s.data(), s.length()).ToLocalChecked();
+      }
+      case FieldDescriptor::CPPTYPE_FLOAT:
+        return Nan::New<Number>(GET(Float));
+      case FieldDescriptor::CPPTYPE_DOUBLE:
+        return Nan::New<Number>(GET(Double));
+      case FieldDescriptor::CPPTYPE_BOOL:
+        if (GET(Bool)) {
+          return Nan::True();
+        }
+        return Nan::False();
+      case FieldDescriptor::CPPTYPE_ENUM:
+        // Use enum number instead of name
+        return Nan::New<Number>(GET(Enum)->number());
+        // return Nan::New<String>(GET(Enum)->name().c_str()).ToLocalChecked();
+      }
+
+      return Nan::Undefined(); // NOTREACHED
     }
-
-    class Type : public Nan::ObjectWrap {
-    public:
-      Schema* schema_;
-      const Descriptor* descriptor_;
-
-      Message* NewMessage() const {
-        return schema_->NewMessage(descriptor_);
-      }
-
-      Local<Function> Constructor() const {
-        Local<Object> handle = const_cast<Type *>(this)->handle();
-        return handle->GetInternalField(2).As<Function>();
-      }
-
-      Local<Object> NewObject(Local<Value> properties) const {
-        return Nan::NewInstance(Constructor(), 1, &properties).ToLocalChecked();
-      }
-
-      Type(Schema* schema, const Descriptor* descriptor, Local<Object> self)
-        : schema_(schema), descriptor_(descriptor) {
-        // Generate functions for bulk conversion between a JS object
-        // and an array in descriptor order:
-        //   from = function(arr) { this.f0 = arr[0]; this.f1 = arr[1]; ... }
-        //   to   = function()    { return [ this.f0, this.f1, ... ] }
-        // This is faster than repeatedly calling Get/Set on a v8::Object.
-        std::ostringstream from, to;
-        from << "(function(arr) { if(arr) {";
-        to << "(function() { return [ ";
-
-        for (int i = 0; i < descriptor->field_count(); i++) {
-          from <<
-            "var x = arr[" << i << "]; "
-            "if(x !== undefined) this['" <<
-            descriptor->field(i)->camelcase_name() <<
-            "'] = x; ";
-
-          if (i > 0) to << ", ";
-          to << "this['" << descriptor->field(i)->camelcase_name() << "']";
-        }
-
-        from << " }})";
-        to << " ]; })";
-
-        // managed type->schema link
-        self->SetInternalField(1, schema_->handle());
-
-        Local<Function> constructor =
-          Script::Compile(Nan::New<String>(from.str()).ToLocalChecked())->Run().As<Function>();
-        Nan::SetPrivate(constructor, Nan::New<String>("type").ToLocalChecked(), self);
-
-        Local<Function> bind =
-          Script::Compile(Nan::New<String>(
-              "(function(self) {"
-              "  var f = this;"
-              "  return function(arg) {"
-              "    return f.call(self, arg);"
-              "  };"
-              "})").ToLocalChecked())->Run().As<Function>();
-        Local<Value> arg = self;
-
-        Local<FunctionTemplate> parseTemplate = Nan::New(ParseTemplate);
-        Local<FunctionTemplate> serializeTemplate = Nan::New(SerializeTemplate);
-
-        constructor->Set(Nan::New<String>("parse").ToLocalChecked(), bind->Call(parseTemplate->GetFunction(), 1, &arg));
-        constructor->Set(Nan::New<String>("serialize").ToLocalChecked(), bind->Call(serializeTemplate->GetFunction(), 1, &arg));
-        self->SetInternalField(2, constructor);
-        self->SetInternalField(3, Script::Compile(Nan::New<String>(to.str()).ToLocalChecked())->Run());
-
-        Wrap(self);
-      }
-
-#define GET(TYPE)                                                        \
-      (index >= 0 ?                                                      \
-       reflection->GetRepeated##TYPE(instance, field, index) :           \
-       reflection->Get##TYPE(instance, field))
-
-      static Local<Value> ToJs(const Message& instance,
-                                const Reflection* reflection,
-                                const FieldDescriptor* field,
-                                const Type* message_type,
-                                int index) {
-        switch (field->cpp_type()) {
-        case FieldDescriptor::CPPTYPE_MESSAGE:
-          return message_type->ToJs(GET(Message));
-        case FieldDescriptor::CPPTYPE_STRING: {
-          const string& value = GET(String);
-          if (field->type() == FieldDescriptor::TYPE_BYTES) {
-            return Nan::CopyBuffer(const_cast<char *>(value.data()), value.length()).ToLocalChecked();
-          } else {
-            return Nan::New<String>(value.data(), value.length()).ToLocalChecked();
-          }
-        }
-        case FieldDescriptor::CPPTYPE_INT32:
-          return Nan::New<v8::Int32>(GET(Int32));
-        case FieldDescriptor::CPPTYPE_UINT32:
-          return Nan::New<v8::Uint32>(GET(UInt32));
-        case FieldDescriptor::CPPTYPE_INT64: {
-          std::ostringstream ss;
-          ss << GET(Int64);
-          string s = ss.str();
-          return Nan::New<String>(s.data(), s.length()).ToLocalChecked();
-        }
-        case FieldDescriptor::CPPTYPE_UINT64: {
-          std::ostringstream ss;
-          ss << GET(UInt64);
-          string s = ss.str();
-          return Nan::New<String>(s.data(), s.length()).ToLocalChecked();
-        }
-        case FieldDescriptor::CPPTYPE_FLOAT:
-          return Nan::New<Number>(GET(Float));
-        case FieldDescriptor::CPPTYPE_DOUBLE:
-          return Nan::New<Number>(GET(Double));
-        case FieldDescriptor::CPPTYPE_BOOL:
-          if (GET(Bool)) {
-            return Nan::True();
-          }
-          return Nan::False();
-        case FieldDescriptor::CPPTYPE_ENUM:
-          return Nan::New<String>(GET(Enum)->name().c_str()).ToLocalChecked();
-        }
-
-        return Nan::Undefined();  // NOTREACHED
-      }
 #undef GET
 
-      Local<Object> ToJs(const Message& instance) const {
-        const Reflection* reflection = instance.GetReflection();
-        const Descriptor* descriptor = instance.GetDescriptor();
+    Local<Object> ToJs(const Message& instance) const {
+      const Reflection* reflection = instance.GetReflection();
+      const Descriptor* descriptor = instance.GetDescriptor();
 
-        Local<Array> properties = Nan::New<Array>(descriptor->field_count());
-        for (int i = 0; i < descriptor->field_count(); i++) {
-          Nan::HandleScope scope;
-
-          const FieldDescriptor* field = descriptor->field(i);
-          bool repeated = field->is_repeated();
-          if (repeated && !reflection->FieldSize(instance, field)) continue;
-          if (!repeated && !reflection->HasField(instance, field)) continue;
-
-          const Type* child_type =
-            (field->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) ?
-            schema_->GetType(field->message_type()) : NULL;
-
-          Local<Value> value;
-          if (field->is_repeated()) {
-            int size = reflection->FieldSize(instance, field);
-            Local<Array> array = Nan::New<Array>(size);
-            for (int j = 0; j < size; j++) {
-              array->Set(j, ToJs(instance, reflection, field, child_type, j));
-            }
-            value = array;
-          } else {
-            value = ToJs(instance, reflection, field, child_type, -1);
-          }
-
-          properties->Set(i, value);
-        }
-
-        return NewObject(properties);
-      }
-
-      static NAN_METHOD(Parse) {
-        if ((info.Length() < 1) || (!node::Buffer::HasInstance(info[0]))) {
-          return Nan::ThrowTypeError("Argument should be a buffer");
-        }
-
-        Local<Object> buffer_obj = info[0]->ToObject();
-
-        Type *type = Unwrap<Type>(info.This());
-        Message* message = type->NewMessage();
-        bool success =
-          message->ParseFromArray(node::Buffer::Data(buffer_obj), node::Buffer::Length(buffer_obj));
-
-        if (!success) {
-          return Nan::ThrowError("Malformed message");
-        }
-
-        Local<Object> result = type->ToJs(*message);
-        delete message;
-        info.GetReturnValue().Set(result);
-      }
-
-#define SET(TYPE, EXPR)                                                 \
-      if (repeated) reflection->Add##TYPE(instance, field, EXPR);       \
-      else reflection->Set##TYPE(instance, field, EXPR)
-
-      static const char* ToProto(Message* instance,
-                                 const FieldDescriptor* field,
-                                 Local<Value> value,
-                                 const Type* type,
-                                 bool repeated) {
+      Local<Array> properties = Nan::New<Array>(descriptor->field_count());
+      for (int i = 0; i < descriptor->field_count(); i++) {
         Nan::HandleScope scope;
 
-        const Reflection* reflection = instance->GetReflection();
-        switch (field->cpp_type()) {
-        case FieldDescriptor::CPPTYPE_MESSAGE:
-          if (!value->IsObject()) {
-            return E_NO_OBJECT;
+        const FieldDescriptor* field = descriptor->field(i);
+        bool repeated = field->is_repeated();
+        if (repeated && !reflection->FieldSize(instance, field))
+          continue;
+        if (!repeated && !reflection->HasField(instance, field))
+          continue;
+
+        const Type* child_type = (field->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) ? schema_->GetType(field->message_type()) : NULL;
+
+        Local<Value> value;
+        if (field->is_repeated()) {
+          int size = reflection->FieldSize(instance, field);
+          Local<Array> array = Nan::New<Array>(size);
+          for (int j = 0; j < size; j++) {
+            array->Set(j, ToJs(instance, reflection, field, child_type, j));
           }
-          type->ToProto(repeated ?
-                        reflection->AddMessage(instance, field) :
-                        reflection->MutableMessage(instance, field),
-                        value.As<Object>());
-          break;
-        case FieldDescriptor::CPPTYPE_STRING: {
-          // Shortcutting Utf8value(buffer.toString())
-          if (node::Buffer::HasInstance(value)) {
-            Local<Object> buf = value->ToObject();
-            SET(String, string(node::Buffer::Data(buf), node::Buffer::Length(buf)));
-          } else {
-            String::Utf8Value utf8(value);
-            SET(String, string(*utf8, utf8.length()));
-          }
-          break;
-        }
-        case FieldDescriptor::CPPTYPE_INT32:
-          SET(Int32, value->Int32Value());
-          break;
-        case FieldDescriptor::CPPTYPE_UINT32:
-          SET(UInt32, value->Uint32Value());
-          break;
-        case FieldDescriptor::CPPTYPE_INT64:
-          if (value->IsString()) {
-            google::protobuf::int64 ll;
-            std::istringstream(*String::Utf8Value(value)) >> ll;
-            SET(Int64, ll);
-          } else {
-            SET(Int64, value->NumberValue());
-          }
-          break;
-        case FieldDescriptor::CPPTYPE_UINT64:
-          if (value->IsString()) {
-            google::protobuf::uint64 ull;
-            std::istringstream(*String::Utf8Value(value)) >> ull;
-            SET(UInt64, ull);
-          } else {
-            SET(UInt64, value->NumberValue());
-          }
-          break;
-        case FieldDescriptor::CPPTYPE_FLOAT:
-          SET(Float, value->NumberValue());
-          break;
-        case FieldDescriptor::CPPTYPE_DOUBLE:
-          SET(Double, value->NumberValue());
-          break;
-        case FieldDescriptor::CPPTYPE_BOOL:
-          SET(Bool, value->BooleanValue());
-          break;
-        case FieldDescriptor::CPPTYPE_ENUM:
-          const google::protobuf::EnumValueDescriptor* enum_value =
-            value->IsNumber() ?
-            field->enum_type()->FindValueByNumber(value->Int32Value()) :
-            field->enum_type()->FindValueByName(*String::Utf8Value(value));
-          if (!enum_value) {
-            return E_UNKNOWN_ENUM;
-          }
-          SET(Enum, enum_value);
-          break;
+          value = array;
+        } else {
+          value = ToJs(instance, reflection, field, child_type, -1);
         }
 
-        return NULL;
-      }
-#undef SET
-
-      const char* ToProto(Message* instance, Local<Object> src) const {
-        Local<Object> handle = const_cast<Type *>(this)->handle();
-        Local<Function> to_array = handle->GetInternalField(3).As<Function>();
-        Local<Array> properties = to_array->Call(src, 0, NULL).As<Array>();
-
-        const char* error = NULL;
-        for (int i = 0; !error && i < descriptor_->field_count(); i++) {
-          Local<Value> value = properties->Get(i);
-          if (value->IsUndefined() ||
-              value->IsNull()) continue;
-
-          const FieldDescriptor* field = descriptor_->field(i);
-          const Type* child_type =
-            (field->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) ?
-            schema_->GetType(field->message_type()) : NULL;
-          if (field->is_repeated()) {
-            if(!value->IsArray()) {
-              error = E_NO_ARRAY;
-              continue;
-            }
-
-            Local<Array> array = value.As<Array>();
-            int length = array->Length();
-
-            for (int j = 0; !error && j < length; j++) {
-              error = ToProto(instance, field, array->Get(j), child_type, true);
-            }
-          } else {
-            error = ToProto(instance, field, value, child_type, false);
-          }
-        }
-        return error;
+        properties->Set(i, value);
       }
 
-      static NAN_METHOD(Serialize) {
-        if ((info.Length() < 1) || (!info[0]->IsObject())) {
-          return Nan::ThrowTypeError("Not an object");
-        }
-
-        Type *type = Unwrap<Type>(info.This());
-        Message* message = type->NewMessage();
-        const char* error = type->ToProto(message, info[0].As<Object>());
-        Local<Object> result;
-        if (!error) {
-          result = Nan::NewBuffer(message->ByteSize()).ToLocalChecked();
-          message->SerializeWithCachedSizesToArray(
-              (google::protobuf::uint8*)node::Buffer::Data(result));
-        }
-        delete message;
-
-        if (error) {
-          return Nan::ThrowError(error);
-        }
-
-        info.GetReturnValue().Set(result);
-      }
-
-      static NAN_METHOD(ToString) {
-        Type *type = Unwrap<Type>(info.This());
-        info.GetReturnValue().Set(Nan::New<String>(type->descriptor_->full_name()).ToLocalChecked());
-      }
-    };
-
-    Message* NewMessage(const Descriptor* descriptor) {
-      return factory_.GetPrototype(descriptor)->New();
+      return NewObject(properties);
     }
 
-    Type* GetType(const Descriptor* descriptor) {
-      Type* result = types_[descriptor];
-      if (result) return result;
-
-      Local<FunctionTemplate> typeTemplate = Nan::New(TypeTemplate);
-      result = types_[descriptor] =
-        new Type(this, descriptor, Nan::NewInstance(typeTemplate->GetFunction()).ToLocalChecked());
-
-      // managed schema->[type] link
-      //
-      Local<Object> handle = const_cast<Schema *>(this)->handle();
-      Local<Array> types = handle->GetInternalField(1).As<Array>();
-      types->Set(types->Length(), result->handle());
-      return result;
-    }
-
-    const DescriptorPool* pool_;
-    map<const Descriptor*, Type*> types_;
-    DynamicMessageFactory factory_;
-
-    static NAN_PROPERTY_GETTER(GetType) {
-      Schema *schema = Unwrap<Schema>(info.This());
-      const Descriptor* descriptor =
-        schema->pool_->FindMessageTypeByName(*String::Utf8Value(property));
-
-      if (descriptor != NULL) {
-        info.GetReturnValue().Set(schema->GetType(descriptor)->Constructor());
-        return;
-      }
-
-      info.GetReturnValue().SetUndefined();
-    }
-
-    static NAN_METHOD(NewSchema) {
-      Schema *schema;
-
-      if (info.Length() < 1) {
-        schema = new Schema(info.This(), DescriptorPool::generated_pool());
-        info.GetReturnValue().Set(schema->handle());
-        return;
-      }
-
-      if (!node::Buffer::HasInstance(info[0])) {
+    static NAN_METHOD(Parse) {
+      if ((info.Length() < 1) || (!node::Buffer::HasInstance(info[0]))) {
         return Nan::ThrowTypeError("Argument should be a buffer");
       }
 
       Local<Object> buffer_obj = info[0]->ToObject();
-      char *buffer_data = node::Buffer::Data(buffer_obj);
-      size_t buffer_length = node::Buffer::Length(buffer_obj);
 
-      FileDescriptorSet descriptors;
-      if (!descriptors.ParseFromArray(buffer_data, buffer_length)) {
-        return Nan::ThrowError("Malformed descriptor");
+      Type* type = Unwrap<Type>(info.This());
+      Message* message = type->NewMessage();
+      bool success = message->ParseFromArray(node::Buffer::Data(buffer_obj), node::Buffer::Length(buffer_obj));
+
+      if (!success) {
+        return Nan::ThrowError("Malformed message");
       }
 
-      DescriptorPool* pool = new DescriptorPool;
-      for (int i = 0; i < descriptors.file_size(); i++) {
-        pool->BuildFile(descriptors.file(i));
+      Local<Object> result = type->ToJs(*message);
+      delete message;
+      info.GetReturnValue().Set(result);
+    }
+
+#define SET(TYPE, EXPR)                           \
+  if (repeated)                                   \
+    reflection->Add##TYPE(instance, field, EXPR); \
+  else                                            \
+    reflection->Set##TYPE(instance, field, EXPR)
+
+    static const char* ToProto(Message* instance, const FieldDescriptor* field, Local<Value> value, const Type* type, bool repeated) {
+      Nan::HandleScope scope;
+
+      const Reflection* reflection = instance->GetReflection();
+      switch (field->cpp_type()) {
+      case FieldDescriptor::CPPTYPE_MESSAGE:
+        if (!value->IsObject()) {
+          return E_NO_OBJECT;
+        }
+        type->ToProto(repeated ? reflection->AddMessage(instance, field) : reflection->MutableMessage(instance, field), value.As<Object>());
+        break;
+      case FieldDescriptor::CPPTYPE_STRING: {
+        // Shortcutting Utf8value(buffer.toString())
+        if (node::Buffer::HasInstance(value)) {
+          Local<Object> buf = value->ToObject();
+          SET(String, string(node::Buffer::Data(buf), node::Buffer::Length(buf)));
+        } else {
+          String::Utf8Value utf8(value);
+          SET(String, string(*utf8, utf8.length()));
+        }
+        break;
+      }
+      case FieldDescriptor::CPPTYPE_INT32:
+        SET(Int32, value->Int32Value());
+        break;
+      case FieldDescriptor::CPPTYPE_UINT32:
+        SET(UInt32, value->Uint32Value());
+        break;
+      case FieldDescriptor::CPPTYPE_INT64:
+        if (value->IsString()) {
+          google::protobuf::int64 ll;
+          std::istringstream(*String::Utf8Value(value)) >> ll;
+          SET(Int64, ll);
+        } else {
+          SET(Int64, value->NumberValue());
+        }
+        break;
+      case FieldDescriptor::CPPTYPE_UINT64:
+        if (value->IsString()) {
+          google::protobuf::uint64 ull;
+          std::istringstream(*String::Utf8Value(value)) >> ull;
+          SET(UInt64, ull);
+        } else {
+          SET(UInt64, value->NumberValue());
+        }
+        break;
+      case FieldDescriptor::CPPTYPE_FLOAT:
+        SET(Float, value->NumberValue());
+        break;
+      case FieldDescriptor::CPPTYPE_DOUBLE:
+        SET(Double, value->NumberValue());
+        break;
+      case FieldDescriptor::CPPTYPE_BOOL:
+        SET(Bool, value->BooleanValue());
+        break;
+      case FieldDescriptor::CPPTYPE_ENUM:
+        const google::protobuf::EnumValueDescriptor* enum_value = value->IsNumber()
+            ? field->enum_type()->FindValueByNumber(value->Int32Value())
+            : field->enum_type()->FindValueByName(*String::Utf8Value(value));
+        if (!enum_value) {
+          return E_UNKNOWN_ENUM;
+        }
+        SET(Enum, enum_value);
+        break;
       }
 
-      schema = new Schema(info.This(), pool);
-      info.GetReturnValue().Set(schema->handle());
+      return NULL;
+    }
+#undef SET
+
+    const char* ToProto(Message* instance, Local<Object> src) const {
+      Local<Object> handle = const_cast<Type*>(this)->handle();
+      Local<Function> to_array = handle->GetInternalField(3).As<Function>();
+      Local<Array> properties = to_array->Call(src, 0, NULL).As<Array>();
+
+      const char* error = NULL;
+      for (int i = 0; !error && i < descriptor_->field_count(); i++) {
+        Local<Value> value = properties->Get(i);
+        if (value->IsUndefined() || value->IsNull())
+          continue;
+
+        const FieldDescriptor* field = descriptor_->field(i);
+        const Type* child_type = (field->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) ? schema_->GetType(field->message_type()) : NULL;
+        if (field->is_repeated()) {
+          if (!value->IsArray()) {
+            error = E_NO_ARRAY;
+            continue;
+          }
+
+          Local<Array> array = value.As<Array>();
+          int length = array->Length();
+
+          for (int j = 0; !error && j < length; j++) {
+            error = ToProto(instance, field, array->Get(j), child_type, true);
+          }
+        } else {
+          error = ToProto(instance, field, value, child_type, false);
+        }
+      }
+      return error;
+    }
+
+    static NAN_METHOD(Serialize) {
+      if ((info.Length() < 1) || (!info[0]->IsObject())) {
+        return Nan::ThrowTypeError("Not an object");
+      }
+
+      Type* type = Unwrap<Type>(info.This());
+      Message* message = type->NewMessage();
+      const char* error = type->ToProto(message, info[0].As<Object>());
+      Local<Object> result;
+      if (!error) {
+        result = Nan::NewBuffer(message->ByteSize()).ToLocalChecked();
+        message->SerializeWithCachedSizesToArray((google::protobuf::uint8*)node::Buffer::Data(result));
+      }
+      delete message;
+
+      if (error) {
+        return Nan::ThrowError(error);
+      }
+
+      info.GetReturnValue().Set(result);
+    }
+
+    static NAN_METHOD(ToString) {
+      Type* type = Unwrap<Type>(info.This());
+      info.GetReturnValue().Set(Nan::New<String>(type->descriptor_->full_name()).ToLocalChecked());
     }
   };
 
- // services
+  Message* NewMessage(const Descriptor* descriptor) { return factory_.GetPrototype(descriptor)->New(); }
+
+  Type* GetType(const Descriptor* descriptor) {
+    Type* result = types_[descriptor];
+    if (result)
+      return result;
+
+    Local<FunctionTemplate> typeTemplate = Nan::New(TypeTemplate);
+    result = types_[descriptor] = new Type(this, descriptor, Nan::NewInstance(typeTemplate->GetFunction()).ToLocalChecked());
+
+    // managed schema->[type] link
+    //
+    Local<Object> handle = const_cast<Schema*>(this)->handle();
+    Local<Array> types = handle->GetInternalField(1).As<Array>();
+    types->Set(types->Length(), result->handle());
+    return result;
+  }
+
+  const DescriptorPool* pool_;
+  map<const Descriptor*, Type*> types_;
+  DynamicMessageFactory factory_;
+
+  static NAN_PROPERTY_GETTER(GetType) {
+    Schema* schema = Unwrap<Schema>(info.This());
+    const Descriptor* descriptor = schema->pool_->FindMessageTypeByName(*String::Utf8Value(property));
+
+    if (descriptor != NULL) {
+      info.GetReturnValue().Set(schema->GetType(descriptor)->Constructor());
+      return;
+    }
+
+    info.GetReturnValue().SetUndefined();
+  }
+
+  static NAN_METHOD(NewSchema) {
+    Schema* schema;
+
+    if (info.Length() < 1) {
+      schema = new Schema(info.This(), DescriptorPool::generated_pool());
+      info.GetReturnValue().Set(schema->handle());
+      return;
+    }
+
+    if (!node::Buffer::HasInstance(info[0])) {
+      return Nan::ThrowTypeError("Argument should be a buffer");
+    }
+
+    Local<Object> buffer_obj = info[0]->ToObject();
+    char* buffer_data = node::Buffer::Data(buffer_obj);
+    size_t buffer_length = node::Buffer::Length(buffer_obj);
+
+    FileDescriptorSet descriptors;
+    if (!descriptors.ParseFromArray(buffer_data, buffer_length)) {
+      return Nan::ThrowError("Malformed descriptor");
+    }
+
+    DescriptorPool* pool = new DescriptorPool;
+    for (int i = 0; i < descriptors.file_size(); i++) {
+      pool->BuildFile(descriptors.file(i));
+    }
+
+    schema = new Schema(info.This(), pool);
+    info.GetReturnValue().Set(schema->handle());
+  }
+};
+
+// services
 
 /*
   class WrappedService : public Nan::ObjectWrap {
@@ -681,61 +661,65 @@ namespace protobuf_for_node {
   uv_async_t WrappedService::AsyncInvocation::ev_done;
 */
 
-  static void Init() {
-    if (!TypeTemplate.IsEmpty()) return;
+static void Init() {
+  if (!TypeTemplate.IsEmpty())
+    return;
 
-    Local<FunctionTemplate> t;
+  Local<FunctionTemplate> t;
 
-    t = Nan::New<FunctionTemplate>();
-    t->SetClassName(Nan::New<String>("Type").ToLocalChecked());
-    // native self
-    // owning schema (so GC can manage our lifecyle)
-    // constructor
-    // toArray
-    t->InstanceTemplate()->SetInternalFieldCount(4);
-    TypeTemplate.Reset(t);
+  t = Nan::New<FunctionTemplate>();
+  t->SetClassName(Nan::New<String>("Type").ToLocalChecked());
+  // native self
+  // owning schema (so GC can manage our lifecyle)
+  // constructor
+  // toArray
+  t->InstanceTemplate()->SetInternalFieldCount(4);
+  TypeTemplate.Reset(t);
 
-    t = Nan::New<FunctionTemplate>(Schema::NewSchema);
-    t->SetClassName(Nan::New<String>("Schema").ToLocalChecked());
-    // native self
-    // array of types (so GC can manage our lifecyle)
-    t->InstanceTemplate()->SetInternalFieldCount(2);
-    Nan::SetNamedPropertyHandler(t->InstanceTemplate(), Schema::GetType);
-    SchemaTemplate.Reset(t);
+  t = Nan::New<FunctionTemplate>(Schema::NewSchema);
+  t->SetClassName(Nan::New<String>("Schema").ToLocalChecked());
+  // native self
+  // array of types (so GC can manage our lifecyle)
+  t->InstanceTemplate()->SetInternalFieldCount(2);
+  Nan::SetNamedPropertyHandler(t->InstanceTemplate(), Schema::GetType);
+  SchemaTemplate.Reset(t);
 
-    t = Nan::New<FunctionTemplate>();
-    t->SetClassName(Nan::New<String>("Schema").ToLocalChecked());
-    // native self
-    // array of types (so GC can manage our lifecyle)
-    t->InstanceTemplate()->SetInternalFieldCount(2);
-    Nan::SetNamedPropertyHandler(t->InstanceTemplate(), Schema::GetType);
-    ServiceSchemaTemplate.Reset(t);
+  t = Nan::New<FunctionTemplate>();
+  t->SetClassName(Nan::New<String>("Schema").ToLocalChecked());
+  // native self
+  // array of types (so GC can manage our lifecyle)
+  t->InstanceTemplate()->SetInternalFieldCount(2);
+  Nan::SetNamedPropertyHandler(t->InstanceTemplate(), Schema::GetType);
+  ServiceSchemaTemplate.Reset(t);
 
-    t = Nan::New<FunctionTemplate>();
-    t->SetClassName(Nan::New<String>("Service").ToLocalChecked());
-    t->InstanceTemplate()->SetInternalFieldCount(2);
-    ServiceTemplate.Reset(t);
+  t = Nan::New<FunctionTemplate>();
+  t->SetClassName(Nan::New<String>("Service").ToLocalChecked());
+  t->InstanceTemplate()->SetInternalFieldCount(2);
+  ServiceTemplate.Reset(t);
 
-    //MethodTemplate  = Persistent<FunctionTemplate>::New(FunctionTemplate::New(WrappedService::Invoke));
+  // MethodTemplate  = Persistent<FunctionTemplate>::New(FunctionTemplate::New(WrappedService::Invoke));
 
-    t = Nan::New<FunctionTemplate>(Schema::Type::Parse);
-    ParseTemplate.Reset(t);
+  t = Nan::New<FunctionTemplate>(Schema::Type::Parse);
+  ParseTemplate.Reset(t);
 
-    t = Nan::New<FunctionTemplate>(Schema::Type::Serialize);
-    SerializeTemplate.Reset(t);
+  t = Nan::New<FunctionTemplate>(Schema::Type::Serialize);
+  SerializeTemplate.Reset(t);
 
-    //WrappedService::Init();
-  }
+  // WrappedService::Init();
+}
 
-  Local<Function> SchemaConstructor() {
-    Init();
-    Local<FunctionTemplate> schemaTemplate = Nan::New(SchemaTemplate);
-    return schemaTemplate->GetFunction();
-  }
+Local<Function> SchemaConstructor() {
+  Init();
+  Local<FunctionTemplate> schemaTemplate = Nan::New(SchemaTemplate);
+  return schemaTemplate->GetFunction();
+}
 
-  void ExportService(Local<Object> target, const char* name, Service* service) {
-    Init();
-    //target->Set(Nan::New<String>(name), (new WrappedService(service))->handle_).ToLocalChecked();
-  }
+void ExportService(Local<Object> target, const char* name, Service* service) {
+  (void)target;
+  (void)name;
+  (void)service;
+  Init();
+  // target->Set(Nan::New<String>(name), (new WrappedService(service))->handle_).ToLocalChecked();
+}
 
-}  // namespace protobuf_for_node
+} // namespace protobuf_for_node
